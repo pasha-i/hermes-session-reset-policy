@@ -141,7 +141,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -418,6 +418,94 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
     return _reset_via_store(source, session_store, session_key)
 
 
+def _owner_chat_notice_enabled(policy: Dict[str, Any]) -> bool:
+    """``session_reset.notify`` — announce each rotation in the chat (default off)."""
+    value = policy.get("notify")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _idle_label(policy: Dict[str, Any]) -> str:
+    try:
+        minutes = int(policy.get("idle_minutes") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes <= 0:
+        return "idle"
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return "idle 1d" if days == 1 else f"idle {days}d"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return "idle 1h" if hours == 1 else f"idle {hours}h"
+    return f"idle {minutes}m"
+
+
+def _notice_text(reason: str, policy: Dict[str, Any]) -> str:
+    if reason == "daily":
+        raw = policy.get("at_hour")
+        try:
+            hour = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            hour = None
+        suffix = f"daily {hour:02d}:00" if hour is not None else "daily"
+        return f"↻ New conversation — {suffix}"
+    return f"↻ New conversation — {_idle_label(policy)}"
+
+
+async def _announce_reset(gateway: Any, source: Any, reason: str,
+                          policy: Dict[str, Any]) -> None:
+    """Send the one-line rotation notice through the chat's own adapter.
+
+    Best-effort by contract: the reset has already happened, so a missing
+    adapter or a failed send must never disturb dispatch.
+    """
+    if not _owner_chat_notice_enabled(policy):
+        return
+    platform = getattr(source, "platform", None)
+    chat_id = getattr(source, "chat_id", None)
+    if platform is None or not chat_id:
+        return
+    adapter = None
+    adapters = getattr(gateway, "adapters", None) or {}
+    try:
+        adapter = adapters.get(platform)
+    except Exception:
+        adapter = None
+    if adapter is None:
+        profile = getattr(source, "profile", None)
+        by_profile = getattr(gateway, "_profile_adapters", None) or {}
+        try:
+            adapter = (by_profile.get(profile) or {}).get(platform) if profile else None
+        except Exception:
+            adapter = None
+    if adapter is None:
+        logger.debug("session-reset-policy: no adapter for %s; skipping notice", platform)
+        return
+    metadata = None
+    thread_id = getattr(source, "thread_id", None)
+    helper = getattr(gateway, "_thread_metadata_for_target", None)
+    if callable(helper):
+        try:
+            metadata = helper(platform, str(chat_id), thread_id, adapter=adapter)
+        except Exception:
+            metadata = None
+    if metadata is None and thread_id:
+        metadata = {"thread_id": str(thread_id)}
+    try:
+        result = await adapter.send(str(chat_id), _notice_text(reason, policy),
+                                    metadata=metadata)
+    except Exception:
+        logger.debug("session-reset-policy: reset notice send failed", exc_info=True)
+        return
+    if getattr(result, "success", True) is False:
+        logger.debug("session-reset-policy: reset notice rejected: %s",
+                     getattr(result, "error", "unknown"))
+
+
 async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
                        session_key: Optional[str] = None, **_extra: Any) -> Optional[Dict[str, str]]:
     """pre_gateway_dispatch body: reset the session when the policy says so.
@@ -498,6 +586,8 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         "session-reset-policy: reset %s (reason=%s, new session %s)",
         key, reason, new_sid or "?",
     )
+    if new_sid != old_sid:
+        await _announce_reset(gateway, source, reason, policy)
     return None  # always allow normal dispatch; the fresh session picks the message up
 
 

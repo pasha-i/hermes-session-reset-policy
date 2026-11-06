@@ -68,12 +68,13 @@ session_reset:
   mode: both          # idle | daily | both | none
   idle_minutes: 60
   at_hour: 4          # local hour for the daily boundary
+  notify: false       # one-line "new conversation" notice in the chat
 ```
 
 `mode: none` or an absent block disables the plugin entirely (no reset, no log
 noise).
 
-Two optional keys, both off by default (an existing config behaves exactly as
+Three optional keys, all off by default (an existing config behaves exactly as
 before):
 
 ```yaml
@@ -90,6 +91,29 @@ session_reset:
     pointer_turns: 3            # later model calls that get a 1-line pointer (0-20)
     session_search_hint: true   # point the agent at session_search(session_id=...)
 ```
+
+### `notify`
+
+With `notify: true` the plugin sends one short line through the chat's own
+adapter immediately after it rotates the conversation:
+
+```
+↻ New conversation — idle 2h
+↻ New conversation — daily 04:00
+```
+
+The reset is otherwise silent — the agent's reply simply arrives from a fresh
+session, which reads like the agent forgot the conversation. The notice tells
+the user *why*.
+
+- Only after a confirmed rotation (`new session != old session`), so a funnel
+  that returns without rotating never produces a false notice.
+- Best-effort: a missing adapter, a raised send or a rejected `SendResult` is
+  debug-logged and never disturbs dispatch — the rotation has already happened.
+- Thread metadata comes from the gateway's own `_thread_metadata_for_target`, so
+  the notice lands in the topic/thread the message came from.
+- Sends through `gateway.adapters` for the launch profile, and through
+  `_profile_adapters` for a secondary profile's own bot.
 
 ### `daily_min_idle_minutes`
 
